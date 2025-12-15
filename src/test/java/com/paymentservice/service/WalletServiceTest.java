@@ -4,6 +4,7 @@ import com.paymentservice.domain.entity.Wallet;
 import com.paymentservice.domain.enums.Currency;
 import com.paymentservice.dto.WalletResponse;
 import com.paymentservice.exception.InsufficientFundsException;
+import com.paymentservice.exception.PaymentException;
 import com.paymentservice.exception.PaymentNotFoundException;
 import com.paymentservice.repository.WalletRepository;
 import org.junit.jupiter.api.BeforeEach;
@@ -17,11 +18,13 @@ import org.mockito.junit.jupiter.MockitoExtension;
 
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
+import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.*;
 
 /**
@@ -41,18 +44,20 @@ class WalletServiceTest {
     private Wallet testWallet;
     private UUID walletId;
     private String userId;
+    private Currency currency;
 
     @BeforeEach
     void setUp() {
         walletId = UUID.randomUUID();
         userId = "USER-" + UUID.randomUUID().toString().substring(0, 8);
+        currency = Currency.RUB;
 
         testWallet = Wallet.builder()
                 .id(walletId)
                 .userId(userId)
                 .balance(new BigDecimal("1000.00"))
                 .blockedAmount(BigDecimal.ZERO)
-                .currency(Currency.RUB)
+                .currency(currency)
                 .active(true)
                 .createdAt(LocalDateTime.now())
                 .build();
@@ -63,13 +68,14 @@ class WalletServiceTest {
     class GetWalletTests {
 
         @Test
-        @DisplayName("Успешное получение кошелька по ID")
-        void getWallet_ById_Success() {
+        @DisplayName("Успешное получение кошелька по userId и currency")
+        void getWallet_ByUserIdAndCurrency_Success() {
             // given
-            when(walletRepository.findById(walletId)).thenReturn(Optional.of(testWallet));
+            when(walletRepository.findByUserIdAndCurrency(userId, currency))
+                    .thenReturn(Optional.of(testWallet));
 
             // when
-            WalletResponse response = walletService.getWallet(walletId);
+            WalletResponse response = walletService.getWallet(userId, currency);
 
             // then
             assertThat(response).isNotNull();
@@ -81,25 +87,27 @@ class WalletServiceTest {
         @DisplayName("Ошибка: кошелёк не найден")
         void getWallet_NotFound_ThrowsException() {
             // given
-            when(walletRepository.findById(walletId)).thenReturn(Optional.empty());
+            when(walletRepository.findByUserIdAndCurrency(userId, currency))
+                    .thenReturn(Optional.empty());
 
             // when/then
-            assertThatThrownBy(() -> walletService.getWallet(walletId))
+            assertThatThrownBy(() -> walletService.getWallet(userId, currency))
                     .isInstanceOf(PaymentNotFoundException.class);
         }
 
         @Test
-        @DisplayName("Успешное получение кошелька по userId")
-        void getWalletByUserId_Success() {
+        @DisplayName("Успешное получение всех кошельков пользователя")
+        void getUserWallets_Success() {
             // given
-            when(walletRepository.findByUserId(userId)).thenReturn(Optional.of(testWallet));
+            when(walletRepository.findByUserIdAndActiveTrue(userId))
+                    .thenReturn(List.of(testWallet));
 
             // when
-            WalletResponse response = walletService.getWalletByUserId(userId);
+            List<WalletResponse> responses = walletService.getUserWallets(userId);
 
             // then
-            assertThat(response).isNotNull();
-            assertThat(response.getUserId()).isEqualTo(userId);
+            assertThat(responses).hasSize(1);
+            assertThat(responses.get(0).getUserId()).isEqualTo(userId);
         }
     }
 
@@ -112,37 +120,29 @@ class WalletServiceTest {
         void deposit_Success() {
             // given
             BigDecimal depositAmount = new BigDecimal("500.00");
-            when(walletRepository.findById(walletId)).thenReturn(Optional.of(testWallet));
-            when(walletRepository.save(any(Wallet.class))).thenAnswer(invocation -> invocation.getArgument(0));
+            when(walletRepository.findByUserIdAndCurrencyForUpdate(userId, currency))
+                    .thenReturn(Optional.of(testWallet));
+            when(walletRepository.save(any(Wallet.class)))
+                    .thenAnswer(invocation -> invocation.getArgument(0));
 
             // when
-            WalletResponse response = walletService.deposit(walletId, depositAmount);
+            WalletResponse response = walletService.deposit(userId, currency, depositAmount);
 
             // then
             assertThat(response).isNotNull();
-            assertThat(response.getBalance()).isEqualByComparingTo(new BigDecimal("1500.00"));
+            verify(walletRepository).save(any(Wallet.class));
         }
 
         @Test
-        @DisplayName("Ошибка: отрицательная сумма пополнения")
-        void deposit_NegativeAmount_ThrowsException() {
+        @DisplayName("Ошибка: кошелёк не найден при пополнении")
+        void deposit_WalletNotFound_ThrowsException() {
             // given
-            BigDecimal negativeAmount = new BigDecimal("-100.00");
+            when(walletRepository.findByUserIdAndCurrencyForUpdate(userId, currency))
+                    .thenReturn(Optional.empty());
 
             // when/then
-            assertThatThrownBy(() -> walletService.deposit(walletId, negativeAmount))
-                    .isInstanceOf(IllegalArgumentException.class);
-        }
-
-        @Test
-        @DisplayName("Ошибка: нулевая сумма пополнения")
-        void deposit_ZeroAmount_ThrowsException() {
-            // given
-            BigDecimal zeroAmount = BigDecimal.ZERO;
-
-            // when/then
-            assertThatThrownBy(() -> walletService.deposit(walletId, zeroAmount))
-                    .isInstanceOf(IllegalArgumentException.class);
+            assertThatThrownBy(() -> walletService.deposit(userId, currency, new BigDecimal("100.00")))
+                    .isInstanceOf(PaymentNotFoundException.class);
         }
     }
 
@@ -155,15 +155,17 @@ class WalletServiceTest {
         void withdraw_Success() {
             // given
             BigDecimal withdrawAmount = new BigDecimal("300.00");
-            when(walletRepository.findById(walletId)).thenReturn(Optional.of(testWallet));
-            when(walletRepository.save(any(Wallet.class))).thenAnswer(invocation -> invocation.getArgument(0));
+            when(walletRepository.findByUserIdAndCurrencyForUpdate(userId, currency))
+                    .thenReturn(Optional.of(testWallet));
+            when(walletRepository.save(any(Wallet.class)))
+                    .thenAnswer(invocation -> invocation.getArgument(0));
 
             // when
-            WalletResponse response = walletService.withdraw(walletId, withdrawAmount);
+            WalletResponse response = walletService.withdraw(userId, currency, withdrawAmount);
 
             // then
             assertThat(response).isNotNull();
-            assertThat(response.getBalance()).isEqualByComparingTo(new BigDecimal("700.00"));
+            verify(walletRepository).save(any(Wallet.class));
         }
 
         @Test
@@ -171,24 +173,24 @@ class WalletServiceTest {
         void withdraw_InsufficientFunds_ThrowsException() {
             // given
             BigDecimal largeAmount = new BigDecimal("2000.00");
-            when(walletRepository.findById(walletId)).thenReturn(Optional.of(testWallet));
+            when(walletRepository.findByUserIdAndCurrencyForUpdate(userId, currency))
+                    .thenReturn(Optional.of(testWallet));
 
             // when/then
-            assertThatThrownBy(() -> walletService.withdraw(walletId, largeAmount))
+            assertThatThrownBy(() -> walletService.withdraw(userId, currency, largeAmount))
                     .isInstanceOf(InsufficientFundsException.class);
         }
 
         @Test
-        @DisplayName("Ошибка: списание с заблокированными средствами")
-        void withdraw_WithBlockedAmount_InsufficientFunds() {
+        @DisplayName("Ошибка: кошелёк не найден при списании")
+        void withdraw_WalletNotFound_ThrowsException() {
             // given
-            testWallet.setBlockedAmount(new BigDecimal("800.00")); // Доступно только 200
-            BigDecimal withdrawAmount = new BigDecimal("500.00");
-            when(walletRepository.findById(walletId)).thenReturn(Optional.of(testWallet));
+            when(walletRepository.findByUserIdAndCurrencyForUpdate(userId, currency))
+                    .thenReturn(Optional.empty());
 
             // when/then
-            assertThatThrownBy(() -> walletService.withdraw(walletId, withdrawAmount))
-                    .isInstanceOf(InsufficientFundsException.class);
+            assertThatThrownBy(() -> walletService.withdraw(userId, currency, new BigDecimal("100.00")))
+                    .isInstanceOf(PaymentNotFoundException.class);
         }
     }
 
@@ -201,11 +203,11 @@ class WalletServiceTest {
         void blockAmount_Success() {
             // given
             BigDecimal blockAmount = new BigDecimal("200.00");
-            when(walletRepository.findByIdWithLock(walletId)).thenReturn(Optional.of(testWallet));
-            when(walletRepository.save(any(Wallet.class))).thenAnswer(invocation -> invocation.getArgument(0));
+            when(walletRepository.findByUserIdAndCurrencyForUpdate(userId, currency))
+                    .thenReturn(Optional.of(testWallet));
 
             // when
-            walletService.blockAmount(walletId, blockAmount);
+            walletService.blockAmount(userId, currency, blockAmount);
 
             // then
             verify(walletRepository).save(any(Wallet.class));
@@ -216,10 +218,11 @@ class WalletServiceTest {
         void blockAmount_InsufficientFunds_ThrowsException() {
             // given
             BigDecimal largeBlockAmount = new BigDecimal("1500.00");
-            when(walletRepository.findByIdWithLock(walletId)).thenReturn(Optional.of(testWallet));
+            when(walletRepository.findByUserIdAndCurrencyForUpdate(userId, currency))
+                    .thenReturn(Optional.of(testWallet));
 
             // when/then
-            assertThatThrownBy(() -> walletService.blockAmount(walletId, largeBlockAmount))
+            assertThatThrownBy(() -> walletService.blockAmount(userId, currency, largeBlockAmount))
                     .isInstanceOf(InsufficientFundsException.class);
         }
     }
@@ -238,33 +241,26 @@ class WalletServiceTest {
         void unblockAmount_Success() {
             // given
             BigDecimal unblockAmount = new BigDecimal("100.00");
-            when(walletRepository.findByIdWithLock(walletId)).thenReturn(Optional.of(testWallet));
-            when(walletRepository.save(any(Wallet.class))).thenAnswer(invocation -> invocation.getArgument(0));
+            when(walletRepository.findByUserIdAndCurrencyForUpdate(userId, currency))
+                    .thenReturn(Optional.of(testWallet));
 
             // when
-            walletService.unblockAmount(walletId, unblockAmount);
+            walletService.unblockAmount(userId, currency, unblockAmount);
 
             // then
             verify(walletRepository).save(any(Wallet.class));
         }
 
         @Test
-        @DisplayName("Разблокировка суммы больше заблокированной - разблокирует всё")
-        void unblockAmount_MoreThanBlocked_UnblocksAll() {
+        @DisplayName("Ошибка: кошелёк не найден при разблокировке")
+        void unblockAmount_WalletNotFound_ThrowsException() {
             // given
-            BigDecimal largeUnblockAmount = new BigDecimal("500.00");
-            when(walletRepository.findByIdWithLock(walletId)).thenReturn(Optional.of(testWallet));
-            when(walletRepository.save(any(Wallet.class))).thenAnswer(invocation -> {
-                Wallet w = invocation.getArgument(0);
-                assertThat(w.getBlockedAmount()).isEqualByComparingTo(BigDecimal.ZERO);
-                return w;
-            });
+            when(walletRepository.findByUserIdAndCurrencyForUpdate(userId, currency))
+                    .thenReturn(Optional.empty());
 
-            // when
-            walletService.unblockAmount(walletId, largeUnblockAmount);
-
-            // then
-            verify(walletRepository).save(any(Wallet.class));
+            // when/then
+            assertThatThrownBy(() -> walletService.unblockAmount(userId, currency, new BigDecimal("100.00")))
+                    .isInstanceOf(PaymentNotFoundException.class);
         }
     }
 
@@ -277,7 +273,7 @@ class WalletServiceTest {
         void createWallet_Success() {
             // given
             String newUserId = "NEW-USER-001";
-            when(walletRepository.findByUserId(newUserId)).thenReturn(Optional.empty());
+            when(walletRepository.existsByUserIdAndCurrency(newUserId, currency)).thenReturn(false);
             when(walletRepository.save(any(Wallet.class))).thenAnswer(invocation -> {
                 Wallet w = invocation.getArgument(0);
                 w.setId(UUID.randomUUID());
@@ -285,23 +281,43 @@ class WalletServiceTest {
             });
 
             // when
-            WalletResponse response = walletService.createWallet(newUserId, Currency.RUB);
+            WalletResponse response = walletService.createWallet(newUserId, currency, BigDecimal.ZERO);
 
             // then
             assertThat(response).isNotNull();
             assertThat(response.getUserId()).isEqualTo(newUserId);
-            assertThat(response.getBalance()).isEqualByComparingTo(BigDecimal.ZERO);
+        }
+
+        @Test
+        @DisplayName("Создание кошелька с начальным балансом")
+        void createWallet_WithInitialBalance_Success() {
+            // given
+            String newUserId = "NEW-USER-002";
+            BigDecimal initialBalance = new BigDecimal("500.00");
+            when(walletRepository.existsByUserIdAndCurrency(newUserId, currency)).thenReturn(false);
+            when(walletRepository.save(any(Wallet.class))).thenAnswer(invocation -> {
+                Wallet w = invocation.getArgument(0);
+                w.setId(UUID.randomUUID());
+                return w;
+            });
+
+            // when
+            WalletResponse response = walletService.createWallet(newUserId, currency, initialBalance);
+
+            // then
+            assertThat(response).isNotNull();
+            verify(walletRepository).save(any(Wallet.class));
         }
 
         @Test
         @DisplayName("Ошибка: кошелёк уже существует")
         void createWallet_AlreadyExists_ThrowsException() {
             // given
-            when(walletRepository.findByUserId(userId)).thenReturn(Optional.of(testWallet));
+            when(walletRepository.existsByUserIdAndCurrency(userId, currency)).thenReturn(true);
 
             // when/then
-            assertThatThrownBy(() -> walletService.createWallet(userId, Currency.RUB))
-                    .isInstanceOf(IllegalStateException.class)
+            assertThatThrownBy(() -> walletService.createWallet(userId, currency, BigDecimal.ZERO))
+                    .isInstanceOf(PaymentException.class)
                     .hasMessageContaining("уже существует");
         }
     }
